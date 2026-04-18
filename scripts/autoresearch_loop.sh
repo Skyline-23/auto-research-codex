@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
 command_name="${1:-}"
 if [[ -z "$command_name" ]]; then
   echo "usage: autoresearch_loop.sh <setup|status|stop|resume|reset> [args]" >&2
@@ -18,6 +20,14 @@ state_dir() {
 
 state_file() {
   printf '%s/state.json\n' "$(state_dir)"
+}
+
+ensure_hooks() {
+  "$SCRIPT_DIR/install.sh" >/dev/null
+}
+
+remove_hooks() {
+  "$SCRIPT_DIR/uninstall.sh" >/dev/null
 }
 
 exclude_state_dir() {
@@ -118,6 +128,7 @@ setup_loop() {
   fi
 
   local root state branch
+  ensure_hooks
   root=$(repo_root)
   branch=$(ensure_branch)
   exclude_state_dir
@@ -206,12 +217,15 @@ case "$command_name" in
     ;;
   stop)
     toggle_active false
+    remove_hooks
     ;;
   resume)
+    ensure_hooks
     toggle_active true
     ;;
   reset)
     reset_loop
+    remove_hooks
     ;;
   *)
     echo "unknown command: $command_name" >&2

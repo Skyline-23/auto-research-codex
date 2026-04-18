@@ -9,10 +9,9 @@ Use `$auto-research-codex` for metric-driven iteration, not for open-ended codin
 
 ## Workflow
 
-1. Install the global hook entries once:
-   - from the skill directory, run `bash scripts/install.sh`
-2. In the target repo, initialize the experiment:
+1. In the target repo, initialize the experiment:
    - from the skill directory, run `bash scripts/autoresearch_loop.sh setup --goal "<goal>" --metric-command "<command>" --metric-regex "<regex>" --direction higher|lower --scope <path>`
+   - setup re-installs this skill's native hook entries automatically
 3. Let Codex keep iterating. The hooks inject the current experiment contract on session start and prompt submit, then the `Stop` hook measures the metric and continues the run automatically.
 4. Inspect or end the loop with:
    - `bash scripts/autoresearch_loop.sh status`
@@ -24,7 +23,7 @@ Use `$auto-research-codex` for metric-driven iteration, not for open-ended codin
 - Require a real metric command and a regex that extracts exactly one numeric value.
 - Keep edits inside the declared scopes. The stop hook checks dirty paths before continuing.
 - Make one bounded experiment per turn. The hook appends one line per measured fingerprint to `.codex-autoresearch/results.tsv`.
-- End cleanly by either running the stop command or emitting a line that is exactly `AUTORESEARCH_DONE` only after the result is actually verified.
+- End cleanly by either running the stop command or emitting a line that is exactly `AUTORESEARCH_DONE` only after the result is actually verified. Both paths remove this skill's hook entries automatically.
 - Treat hooks as experimental and unavailable on Windows.
 
 ## Outputs
