@@ -172,7 +172,7 @@ def canonical_repo(path_like):
     path = pathlib.Path(path_like)
     if not path.is_absolute():
         path = (cwd / path).resolve()
-    return pathlib.Path(git_run(path, ["rev-parse", "--show-toplevel"]).stdout.strip())
+    return pathlib.Path(git_run(path, ["rev-parse", "--show-toplevel"]).stdout.strip()).resolve()
 
 
 repo_roots = []
@@ -187,22 +187,35 @@ if metric_repo not in repo_roots:
     raise SystemExit("--metric-repo must be one of the configured --repo roots")
 
 
-def repo_by_selector(selector: str):
-    selector = selector.strip()
+def repo_for_absolute_scope(scope_path: pathlib.Path):
+    scope_path = scope_path.resolve()
+    matches = []
     for repo in repo_roots:
-        if selector == repo.name or selector == str(repo):
-            return repo
-    raise SystemExit(f"unknown repo selector: {selector}")
+        try:
+            scope_path.relative_to(repo)
+            matches.append(repo)
+        except ValueError:
+            continue
+    if not matches:
+        raise SystemExit(f"scope path is outside every configured repo: {scope_path}")
+    matches.sort(key=lambda repo: len(str(repo)), reverse=True)
+    return matches[0]
 
 
 def assign_scope_map(specs):
     mapping = {str(repo): [] for repo in repo_roots}
     for spec in specs:
-        if "::" in spec:
-            selector, rel = spec.split("::", 1)
-            mapping[str(repo_by_selector(selector))].append(rel)
+        raw_spec = spec.strip()
+        if not raw_spec:
+            continue
+        scope_path = pathlib.Path(raw_spec)
+        if scope_path.is_absolute():
+            repo = repo_for_absolute_scope(scope_path)
+            rel = scope_path.relative_to(repo)
+            mapping[str(repo)].append("." if str(rel) == "." else rel.as_posix())
+            continue
         else:
-            mapping[str(primary_repo)].append(spec)
+            mapping[str(primary_repo)].append(raw_spec)
     return mapping
 
 

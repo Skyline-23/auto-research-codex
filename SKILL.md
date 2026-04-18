@@ -11,6 +11,8 @@ This skill is based on the public `awesome-copilot/autoresearch` workflow, but u
 
 Default mode is one repo. Multi-repo tracking is optional and only turns on when you explicitly pass extra `--repo` flags.
 
+Prefer absolute paths for `--in-scope` and `--out-of-scope`. The script will map each absolute path to the correct tracked repo automatically.
+
 ## Phase 1: Setup
 
 Before the loop starts, collect and confirm every item below. Do not skip any.
@@ -43,8 +45,8 @@ bash scripts/autoresearch_loop.sh setup \
   --metric-command "<command>" \
   --metric-regex "<regex>" \
   --direction higher|lower \
-  --in-scope <path> \
-  --out-of-scope <path> \
+  --in-scope /absolute/path/in/this/repo \
+  --out-of-scope /absolute/path/to/avoid \
   --constraint "<constraint>" \
   --max-experiments <number|unlimited> \
   --simplicity-policy "<policy>"
@@ -69,16 +71,16 @@ bash scripts/autoresearch_loop.sh setup \
   --metric-command "<command>" \
   --metric-regex "<regex>" \
   --direction higher|lower \
-  --in-scope primary-repo::src \
-  --in-scope second-repo::Sources \
-  --out-of-scope second-repo::Examples
+  --in-scope /path/to/primary-repo/src \
+  --in-scope /path/to/second-repo/Sources \
+  --out-of-scope /path/to/second-repo/Examples
 ```
 
 Rules for multi-repo mode:
 
 - If you omit `--repo`, it stays single-repo.
-- Unqualified scope paths apply to the primary repo.
-- Qualified scope paths use `repo-name::relative/path`.
+- Absolute scope paths are preferred and are mapped to the matching tracked repo automatically.
+- Unqualified relative scope paths still apply to the primary repo.
 - The Stop hook evaluates one experiment across all tracked repos atomically.
 
 ## Phase 3: Experiment loop
