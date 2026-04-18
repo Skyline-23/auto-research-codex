@@ -15,16 +15,29 @@ export HOOK_SCRIPT_DIR="$SCRIPT_DIR"
 
 python3 - "$event" <<'PY'
 import datetime as dt
-import hashlib
 import json
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import sys
 
 event = sys.argv[1]
 payload = json.loads(os.environ["HOOK_PAYLOAD"])
+
+
+def repo_root_from(payload_cwd):
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=payload_cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return pathlib.Path(result.stdout.strip())
 
 
 def git_output(args, cwd):
@@ -40,17 +53,15 @@ def git_output(args, cwd):
     return result.stdout.rstrip("\n")
 
 
-def repo_root_from(payload_cwd):
+def git_ok(args, cwd):
     result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=payload_cwd,
+        ["git", *args],
+        cwd=cwd,
         text=True,
         capture_output=True,
         check=False,
     )
-    if result.returncode != 0:
-        return None
-    return pathlib.Path(result.stdout.strip())
+    return result.returncode == 0, result.stdout, result.stderr
 
 
 def load_state(root):
@@ -74,22 +85,46 @@ def cleanup_hooks():
     )
 
 
-def normalize_scope(scope):
-    scope = scope.strip()
-    if scope in ("", ".", "./"):
-        return ""
-    return scope.strip("/")
-
-
-def path_in_scope(path, scopes):
+def path_matches_scope(path, scope):
     normalized = path.strip("/")
-    for scope in scopes:
-        prefix = normalize_scope(scope)
-        if prefix == "":
-            return True
-        if normalized == prefix or normalized.startswith(prefix + "/"):
+    scope = scope.strip().strip("/")
+    if scope in ("", ".", "./"):
+        return True
+    return normalized == scope or normalized.startswith(scope + "/")
+
+
+def path_allowed(path, in_scope, out_of_scope):
+    if not any(path_matches_scope(path, scope) for scope in in_scope):
+        return False
+    if any(path_matches_scope(path, scope) for scope in out_of_scope):
+        return False
+    return True
+
+
+def has_done_marker(message, marker):
+    for line in message.splitlines():
+        if line.strip() == marker:
             return True
     return False
+
+
+def summarize_state(state):
+    max_text = "unlimited" if state.get("max_experiments") is None else str(state["max_experiments"])
+    constraints = "; ".join(state["constraints"]) if state["constraints"] else "none"
+    out_of_scope = ", ".join(state["out_of_scope"]) if state["out_of_scope"] else "none"
+    return (
+        f'Autoresearch is active. Goal: {state["goal"]}. '
+        f'Baseline: {state["baseline_value"]}. '
+        f'Best: {state["best_value"]} at {state["best_commit"][:12]}. '
+        f'Experiments run: {state["experiments_run"]}/{max_text}. '
+        f'In scope: {", ".join(state["in_scope"])}. '
+        f'Out of scope: {out_of_scope}. '
+        f'Constraints: {constraints}. '
+        "Protocol: make one focused change, commit it as "
+        '"experiment: ...", then let the Stop hook measure it. '
+        "Non-improvements are reverted automatically. "
+        f'Emit {state["done_marker"]} or run scripts/autoresearch_loop.sh stop to finish.'
+    )
 
 
 def parse_metric(text, pattern):
@@ -103,37 +138,68 @@ def parse_metric(text, pattern):
         return None
 
 
-def summarize_state(state):
-    best = "none yet"
-    if state.get("best_value") is not None:
-        best = f'{state["best_value"]} ({state.get("best_label") or "best"})'
-    scopes = ", ".join(state["scopes"])
-    return (
-        f'Autoresearch is active. Goal: {state["goal"]}. '
-        f'Metric command: {state["metric_command"]}. '
-        f'Stay inside scope: {scopes}. '
-        f'Best metric: {best}. '
-        f'Budget: {state["iterations"]}/{state["budget"]}. '
-        "If the user asks to stop or change goals, run scripts/autoresearch_loop.sh stop first. "
-        f'Emit {state["done_marker"]} or run scripts/autoresearch_loop.sh stop when done.'
+def append_result(root, state, commit_hash, metric_value, status, description):
+    results_path = root / state["results_path"]
+    metric_text = "" if metric_value is None else str(metric_value)
+    with results_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            f'{state["next_experiment"]}\t{commit_hash}\t{metric_text}\t{status}\t{description}\n'
+        )
+    state["experiments_run"] += 1
+    state["next_experiment"] += 1
+
+
+def run_metric(root, state):
+    log_path = root / state["log_path"]
+    command = f'{state["metric_command"]} > {shlex.quote(str(log_path))} 2>&1'
+    result = subprocess.run(
+        command,
+        cwd=root,
+        shell=True,
+        text=True,
+        capture_output=True,
+        check=False,
     )
+    metric_text = log_path.read_text() if log_path.exists() else ""
+    return result, metric_text
 
 
-def has_done_marker(message, marker):
-    for line in message.splitlines():
-        if line.strip() == marker:
-            return True
+def tail_run_log(root, state, lines=20):
+    log_path = root / state["log_path"]
+    if not log_path.exists():
+        return ""
+    text = log_path.read_text().splitlines()
+    return "\n".join(text[-lines:])
+
+
+def maybe_finish(root, state, state_path):
+    max_experiments = state.get("max_experiments")
+    if max_experiments is not None and state["experiments_run"] >= max_experiments:
+        state["active"] = False
+        state["last_transition"] = "budget-reached"
+        state["stopped_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        state["updated_at"] = state["stopped_at"]
+        write_state(state_path, state)
+        cleanup_hooks()
+        return True
     return False
+
+
+def current_head_files(root):
+    ok, stdout, _ = git_ok(["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"], root)
+    if not ok:
+        return []
+    return [line.strip() for line in stdout.splitlines() if line.strip()]
 
 
 root = repo_root_from(payload["cwd"])
 if root is None:
-    sys.exit(0)
+    raise SystemExit(0)
 
 state, state_path = load_state(root)
 if not state or not state.get("active"):
     cleanup_hooks()
-    sys.exit(0)
+    raise SystemExit(0)
 
 if event in {"session-start", "user-prompt"}:
     print(
@@ -146,10 +212,10 @@ if event in {"session-start", "user-prompt"}:
             }
         )
     )
-    sys.exit(0)
+    raise SystemExit(0)
 
 if payload.get("stop_hook_active"):
-    sys.exit(0)
+    raise SystemExit(0)
 
 last_message = payload.get("last_assistant_message") or ""
 if has_done_marker(last_message, state["done_marker"]):
@@ -159,165 +225,128 @@ if has_done_marker(last_message, state["done_marker"]):
     state["updated_at"] = state["stopped_at"]
     write_state(state_path, state)
     cleanup_hooks()
-    sys.exit(0)
+    raise SystemExit(0)
 
 try:
-    status_output = git_output(["status", "--porcelain"], root)
+    dirty_output = git_output(["status", "--porcelain"], root)
+    head_commit = git_output(["rev-parse", "HEAD"], root)
+    head_subject = git_output(["log", "-1", "--pretty=%s", "HEAD"], root)
 except RuntimeError:
-    sys.exit(0)
+    raise SystemExit(0)
 
-dirty_paths = []
-if status_output:
-    for line in status_output.splitlines():
-        dirty_paths.append(line[3:].strip())
-
-out_of_scope = [path for path in dirty_paths if not path_in_scope(path, state["scopes"])]
-if out_of_scope:
+dirty_paths = [line[3:].strip() for line in dirty_output.splitlines() if line.strip()]
+if dirty_paths:
+    out_of_scope_dirty = [path for path in dirty_paths if not path_allowed(path, state["in_scope"], state["out_of_scope"])]
+    if out_of_scope_dirty:
+        reason = (
+            "Autoresearch found uncommitted out-of-scope changes: "
+            + ", ".join(out_of_scope_dirty[:8])
+            + ". Revert those files before the loop continues."
+        )
+        print(json.dumps({"decision": "block", "reason": reason}))
+        raise SystemExit(0)
     reason = (
-        "Autoresearch is active, but dirty files escaped the declared scope: "
-        + ", ".join(out_of_scope[:8])
-        + ". Clean those paths or narrow the experiment before continuing."
+        "Autoresearch requires every experiment to be committed before evaluation. "
+        'Commit the current change as `experiment: ...`, then let the Stop hook run again.'
     )
     print(json.dumps({"decision": "block", "reason": reason}))
-    sys.exit(0)
+    raise SystemExit(0)
 
-metric_command = state["metric_command"]
-metric_run = subprocess.run(
-    metric_command,
-    cwd=root,
-    shell=True,
-    text=True,
-    capture_output=True,
-    check=False,
-)
-metric_text = "\n".join(
-    part for part in [metric_run.stdout.strip(), metric_run.stderr.strip()] if part
-)
+if head_commit == state.get("last_evaluated_commit"):
+    reason = (
+        f'Autoresearch is active for goal "{state["goal"]}". '
+        f'Best metric: {state["best_value"]}. '
+        "No new experiment commit was found since the last evaluation. "
+        "Make one new experiment commit and stop again."
+    )
+    print(json.dumps({"decision": "block", "reason": reason}))
+    raise SystemExit(0)
+
+head_files = current_head_files(root)
+off_limits = [path for path in head_files if not path_allowed(path, state["in_scope"], state["out_of_scope"])]
+if off_limits:
+    append_result(root, state, head_commit, None, "discard", f"reverted out-of-scope change: {', '.join(off_limits[:4])}")
+    subprocess.run(["git", "reset", "--hard", "HEAD~1"], cwd=root, text=True, capture_output=True, check=False)
+    state["last_transition"] = "discarded-out-of-scope"
+    state["last_metric"] = None
+    state["last_status"] = "discard"
+    state["last_evaluated_commit"] = git_output(["rev-parse", "HEAD"], root)
+    state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    write_state(state_path, state)
+    if maybe_finish(root, state, state_path):
+        raise SystemExit(0)
+    reason = (
+        "The last experiment touched out-of-scope files and was reverted automatically. "
+        "Try another experiment that stays inside the approved paths."
+    )
+    print(json.dumps({"decision": "block", "reason": reason}))
+    raise SystemExit(0)
+
+metric_run, metric_text = run_metric(root, state)
 metric_value = parse_metric(metric_text, state["metric_regex"])
 
-diff_text = subprocess.run(
-    ["git", "diff", "--no-ext-diff", "--no-color"],
-    cwd=root,
-    text=True,
-    capture_output=True,
-    check=False,
-).stdout
-cached_diff_text = subprocess.run(
-    ["git", "diff", "--cached", "--no-ext-diff", "--no-color"],
-    cwd=root,
-    text=True,
-    capture_output=True,
-    check=False,
-).stdout
-fingerprint = hashlib.sha256(
-    ("\n".join([status_output, diff_text, cached_diff_text])).encode("utf-8")
-).hexdigest()
-previous_fingerprint = state.get("last_fingerprint")
-
-label = "iteration"
-if last_message:
-    label = last_message.splitlines()[0].strip()[:120] or label
-
-results_path = root / ".codex-autoresearch" / "results.tsv"
-log_path = root / ".codex-autoresearch" / "run.log"
-
-if metric_value is not None and fingerprint != previous_fingerprint:
-    state["iterations"] += 1
-    state["last_value"] = metric_value
-    state["last_label"] = label
-    state["last_fingerprint"] = fingerprint
-    state["last_transition"] = "measured"
+if metric_run.returncode != 0 or metric_value is None:
+    append_result(root, state, head_commit, None, "crash", head_subject)
+    subprocess.run(["git", "reset", "--hard", "HEAD~1"], cwd=root, text=True, capture_output=True, check=False)
+    state["last_transition"] = "crash-reverted"
+    state["last_metric"] = None
+    state["last_status"] = "crash"
+    state["last_evaluated_commit"] = git_output(["rev-parse", "HEAD"], root)
     state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-
-    is_better = False
-    best_value = state.get("best_value")
-    if best_value is None:
-        is_better = True
-    elif state["direction"] == "lower" and metric_value < best_value:
-        is_better = True
-    elif state["direction"] == "higher" and metric_value > best_value:
-        is_better = True
-
-    if is_better:
-        state["best_value"] = metric_value
-        state["best_label"] = label
-
-    with results_path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            f'{dt.datetime.now(dt.timezone.utc).isoformat()}\t'
-            f'{state["iterations"]}\t{metric_value}\t'
-            f'{"best" if is_better else "recorded"}\t{label}\n'
-        )
-
-with log_path.open("a", encoding="utf-8") as handle:
-    handle.write(
-        json.dumps(
-            {
-                "timestamp": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "event": "stop",
-                "label": label,
-                "metric_exit_code": metric_run.returncode,
-                "metric_value": metric_value,
-                "fingerprint": fingerprint,
-            }
-        )
-        + "\n"
-    )
-
-if metric_value is None:
-    state["last_transition"] = "metric-parse-failed"
-    state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-elif fingerprint == previous_fingerprint:
-    state["last_transition"] = "continuation-no-new-fingerprint"
-    state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-
-write_state(state_path, state)
-
-if state["iterations"] >= state["budget"]:
-    state["active"] = False
-    state["last_transition"] = "budget-reached"
-    state["stopped_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    state["updated_at"] = state["stopped_at"]
     write_state(state_path, state)
-    cleanup_hooks()
-    print(
-        json.dumps(
-            {
-                "continue": False,
-                "stopReason": "autoresearch budget reached",
-                "systemMessage": (
-                    "Autoresearch budget reached. "
-                    f'Best metric: {state.get("best_value")} ({state.get("best_label") or "n/a"}).'
-                ),
-            }
-        )
-    )
-    sys.exit(0)
-
-if metric_value is None:
+    if maybe_finish(root, state, state_path):
+        raise SystemExit(0)
+    log_tail = tail_run_log(root, state, lines=12).strip()
     reason = (
-        "Autoresearch is active but the metric command did not yield a parseable value. "
-        f'Command: {metric_command}. Regex: {state["metric_regex"]}. '
-        "Fix the measurement or adjust the regex before the next stop. "
-        "If the goal changed, stop the loop first."
+        "The last experiment crashed or did not yield a parseable metric and was reverted automatically. "
+        "Read run.log, fix the likely issue, and try another focused experiment."
+    )
+    if log_tail:
+        reason += "\nRecent run.log tail:\n" + log_tail
+    print(json.dumps({"decision": "block", "reason": reason}))
+    raise SystemExit(0)
+
+best_value = state["best_value"]
+improved = (
+    metric_value < best_value if state["direction"] == "lower" else metric_value > best_value
+)
+
+if improved:
+    append_result(root, state, head_commit, metric_value, "keep", head_subject)
+    state["best_value"] = metric_value
+    state["best_commit"] = head_commit
+    state["best_description"] = head_subject
+    state["last_transition"] = "keep"
+    state["last_metric"] = metric_value
+    state["last_status"] = "keep"
+    state["last_evaluated_commit"] = head_commit
+    state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    write_state(state_path, state)
+    if maybe_finish(root, state, state_path):
+        raise SystemExit(0)
+    reason = (
+        f'Autoresearch kept experiment {state["next_experiment"] - 1}. '
+        f"Metric improved from {best_value} to {metric_value}. "
+        "Use the new best state as the baseline for the next experiment."
     )
     print(json.dumps({"decision": "block", "reason": reason}))
-    sys.exit(0)
+    raise SystemExit(0)
 
-best_text = state.get("best_value")
-if best_text is None:
-    best_text = "none yet"
-else:
-    best_text = f'{best_text} ({state.get("best_label") or "best"})'
+append_result(root, state, head_commit, metric_value, "discard", head_subject)
+subprocess.run(["git", "reset", "--hard", "HEAD~1"], cwd=root, text=True, capture_output=True, check=False)
+state["last_transition"] = "discard-reverted"
+state["last_metric"] = metric_value
+state["last_status"] = "discard"
+state["last_evaluated_commit"] = git_output(["rev-parse", "HEAD"], root)
+state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+write_state(state_path, state)
+if maybe_finish(root, state, state_path):
+    raise SystemExit(0)
 
 reason = (
-    f'Autoresearch is active for goal "{state["goal"]}". '
-    f"Current metric: {metric_value}. "
-    f"Best metric: {best_text}. "
-    f"Budget used: {state['iterations']}/{state['budget']}. "
-    "Review the last change, keep edits inside scope, make one more bounded experiment, "
-    "and stop again. If the user asks to stop or pivot, run scripts/autoresearch_loop.sh stop first. "
-    f'Emit a line that is exactly {state["done_marker"]} or run scripts/autoresearch_loop.sh stop to finish.'
+    f'Autoresearch discarded experiment {state["next_experiment"] - 1}. '
+    f"Metric {metric_value} did not beat best {best_value}. "
+    "The branch was reset to the last known good commit. Try a different idea."
 )
 print(json.dumps({"decision": "block", "reason": reason}))
 PY
