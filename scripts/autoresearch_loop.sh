@@ -5,30 +5,10 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 command_name="${1:-}"
 if [[ -z "$command_name" ]]; then
-  echo "usage: autoresearch_loop.sh <setup|status|stop|resume|reset> [args]" >&2
+  echo "usage: autoresearch_loop.sh <setup|status|stop|resume|resume-native|manual-fallback|reset> [args]" >&2
   exit 1
 fi
 shift
-
-repo_root() {
-  git rev-parse --show-toplevel
-}
-
-state_dir() {
-  printf '%s/.codex-autoresearch\n' "$(repo_root)"
-}
-
-state_file() {
-  printf '%s/state.json\n' "$(state_dir)"
-}
-
-results_file() {
-  printf '%s/results.tsv\n' "$(repo_root)"
-}
-
-run_log_file() {
-  printf '%s/run.log\n' "$(repo_root)"
-}
 
 ensure_hooks() {
   /bin/bash "$SCRIPT_DIR/install.sh" >/dev/null
@@ -38,75 +18,41 @@ remove_hooks() {
   /bin/bash "$SCRIPT_DIR/uninstall.sh" >/dev/null
 }
 
-exclude_runtime_files() {
-  local root info exclude
-  root=$(repo_root)
-  info="$root/.git/info"
-  exclude="$info/exclude"
-  mkdir -p "$info"
-  touch "$exclude"
-  for entry in ".codex-autoresearch/" "results.tsv" "run.log"; do
-    if ! grep -Fxq "$entry" "$exclude"; then
-      printf '\n%s\n' "$entry" >>"$exclude"
-    fi
-  done
-}
-
-ensure_branch() {
-  local branch
-  branch="autoresearch/$(date +%Y%m%d)"
-  if git show-ref --verify --quiet "refs/heads/$branch"; then
-    git checkout "$branch" >/dev/null
-  else
-    git checkout -b "$branch" >/dev/null
-  fi
-  printf '%s\n' "$branch"
-}
-
-parse_metric_from_log() {
-  python3 - "$1" "$2" <<'PY'
-import pathlib
-import re
-import sys
-
-log_path = pathlib.Path(sys.argv[1])
-pattern = sys.argv[2]
-text = log_path.read_text() if log_path.exists() else ""
-match = re.search(pattern, text, re.MULTILINE)
-if not match:
-    raise SystemExit(1)
-token = match.group(1) if match.groups() else match.group(0)
-print(float(token))
-PY
-}
-
-write_state() {
-  python3 - "$@" <<'PY'
+resolve_state_path() {
+  python3 - "$PWD" <<'PY'
 import json
 import pathlib
+import subprocess
 import sys
 
-path = pathlib.Path(sys.argv[1])
-payload = json.loads(sys.argv[2])
-path.parent.mkdir(parents=True, exist_ok=True)
-path.write_text(json.dumps(payload, indent=2) + "\n")
-print(json.dumps(payload, indent=2))
+cwd = pathlib.Path(sys.argv[1]).resolve()
+result = subprocess.run(
+    ["git", "rev-parse", "--show-toplevel"],
+    cwd=cwd,
+    text=True,
+    capture_output=True,
+    check=False,
+)
+if result.returncode != 0:
+    raise SystemExit("not inside a git repo")
+root = pathlib.Path(result.stdout.strip())
+state_path = root / ".codex-autoresearch" / "state.json"
+if state_path.exists():
+    print(state_path)
+    raise SystemExit(0)
+pointer_path = root / ".codex-autoresearch" / "session.json"
+if pointer_path.exists():
+    print(json.loads(pointer_path.read_text())["state_path"])
+    raise SystemExit(0)
+raise SystemExit(f"no autoresearch state for {root}")
 PY
-}
-
-load_state() {
-  local path
-  path=$(state_file)
-  if [[ ! -f "$path" ]]; then
-    echo "no autoresearch state at $path" >&2
-    exit 1
-  fi
-  cat "$path"
 }
 
 setup_loop() {
   local goal="" metric_command="" metric_regex="" direction="" max_experiments="unlimited"
   local simplicity_policy="All else equal, simpler is better."
+  local metric_repo=""
+  local repos=()
   local in_scope=()
   local out_of_scope=()
   local constraints=()
@@ -127,6 +73,14 @@ setup_loop() {
         ;;
       --direction)
         direction="$2"
+        shift 2
+        ;;
+      --metric-repo)
+        metric_repo="$2"
+        shift 2
+        ;;
+      --repo)
+        repos+=("$2")
         shift 2
         ;;
       --in-scope)
@@ -168,104 +122,223 @@ setup_loop() {
     echo "--max-experiments must be a number or unlimited" >&2
     exit 1
   fi
-  if [[ -n "$(git status --porcelain)" ]]; then
-    echo "setup requires a clean git worktree" >&2
-    exit 1
+
+  if [[ ${#repos[@]} -eq 0 ]]; then
+    repos+=("$PWD")
   fi
 
-  local root branch results_path log_path baseline_value baseline_commit state
   ensure_hooks
-  root=$(repo_root)
-  branch=$(ensure_branch)
-  exclude_runtime_files
-  results_path=$(results_file)
-  log_path=$(run_log_file)
-
-  if [[ ! -f "$results_path" ]]; then
-    printf 'experiment\tcommit\tmetric\tstatus\tdescription\n' >"$results_path"
-  fi
-
-  if ! bash -lc "$metric_command" >"$log_path" 2>&1; then
-    echo "baseline metric command failed; inspect $log_path" >&2
-    exit 1
-  fi
-  if ! baseline_value=$(parse_metric_from_log "$log_path" "$metric_regex"); then
-    echo "baseline metric could not be parsed from $log_path" >&2
-    exit 1
-  fi
-  baseline_commit=$(git rev-parse HEAD)
-  printf '0\t%s\t%s\tbaseline\tunmodified code\n' "$baseline_commit" "$baseline_value" >>"$results_path"
-
-  state=$(python3 - "$root" "$goal" "$metric_command" "$metric_regex" "$direction" "$branch" "$baseline_value" "$baseline_commit" "$results_path" "$log_path" "$max_experiments" "$simplicity_policy" "${in_scope[@]}" -- "${out_of_scope[@]-}" -- "${constraints[@]-}" <<'PY'
+  python3 - "$PWD" "$goal" "$metric_command" "$metric_regex" "$direction" "$max_experiments" "$simplicity_policy" "$metric_repo" "${repos[@]}" -- "${in_scope[@]}" -- "${out_of_scope[@]-}" -- "${constraints[@]-}" <<'PY'
 import datetime as dt
 import json
 import pathlib
+import re
+import subprocess
 import sys
 
-root = pathlib.Path(sys.argv[1])
+cwd = pathlib.Path(sys.argv[1]).resolve()
 goal = sys.argv[2]
 metric_command = sys.argv[3]
 metric_regex = sys.argv[4]
 direction = sys.argv[5]
-branch = sys.argv[6]
-baseline_value = float(sys.argv[7])
-baseline_commit = sys.argv[8]
-results_path = pathlib.Path(sys.argv[9]).name
-log_path = pathlib.Path(sys.argv[10]).name
-max_experiments_raw = sys.argv[11]
-simplicity_policy = sys.argv[12]
+max_experiments_raw = sys.argv[6]
+simplicity_policy = sys.argv[7]
+metric_repo_arg = sys.argv[8]
+parts = sys.argv[9:]
 
-parts = sys.argv[13:]
-separator_1 = parts.index("--")
-separator_2 = parts.index("--", separator_1 + 1)
-in_scope = [item for item in parts[:separator_1] if item]
-out_of_scope = [item for item in parts[separator_1 + 1:separator_2] if item]
-constraints = [item for item in parts[separator_2 + 1:] if item]
+sep1 = parts.index("--")
+sep2 = parts.index("--", sep1 + 1)
+sep3 = parts.index("--", sep2 + 1)
+repo_specs = [item for item in parts[:sep1] if item]
+in_scope_specs = [item for item in parts[sep1 + 1:sep2] if item]
+out_scope_specs = [item for item in parts[sep2 + 1:sep3] if item]
+constraints = [item for item in parts[sep3 + 1:] if item]
+
+
+def git_run(repo, args, check=True):
+    result = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        raise SystemExit(result.stderr.strip() or f"git {' '.join(args)} failed")
+    return result
+
+
+def canonical_repo(path_like):
+    path = pathlib.Path(path_like)
+    if not path.is_absolute():
+        path = (cwd / path).resolve()
+    return pathlib.Path(git_run(path, ["rev-parse", "--show-toplevel"]).stdout.strip())
+
+
+repo_roots = []
+for spec in repo_specs:
+    root = canonical_repo(spec)
+    if root not in repo_roots:
+        repo_roots.append(root)
+
+primary_repo = repo_roots[0]
+metric_repo = canonical_repo(metric_repo_arg) if metric_repo_arg else primary_repo
+if metric_repo not in repo_roots:
+    raise SystemExit("--metric-repo must be one of the configured --repo roots")
+
+
+def repo_by_selector(selector: str):
+    selector = selector.strip()
+    for repo in repo_roots:
+        if selector == repo.name or selector == str(repo):
+            return repo
+    raise SystemExit(f"unknown repo selector: {selector}")
+
+
+def assign_scope_map(specs):
+    mapping = {str(repo): [] for repo in repo_roots}
+    for spec in specs:
+        if "::" in spec:
+            selector, rel = spec.split("::", 1)
+            mapping[str(repo_by_selector(selector))].append(rel)
+        else:
+            mapping[str(primary_repo)].append(spec)
+    return mapping
+
+
+in_scope_map = assign_scope_map(in_scope_specs)
+out_scope_map = assign_scope_map(out_scope_specs)
+
+for repo in repo_roots:
+    if not in_scope_map[str(repo)]:
+        in_scope_map[str(repo)] = ["."]
+    if git_run(repo, ["status", "--porcelain"]).stdout.strip():
+        raise SystemExit(f"setup requires a clean git worktree: {repo}")
+
+branch = f'autoresearch/{dt.datetime.now().strftime("%Y%m%d")}'
+for repo in repo_roots:
+    exists = git_run(repo, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], check=False).returncode == 0
+    if exists:
+        git_run(repo, ["checkout", branch])
+    else:
+        git_run(repo, ["checkout", "-b", branch])
+
+
+def ensure_exclude(repo: pathlib.Path, entries):
+    exclude = repo / ".git" / "info" / "exclude"
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    lines = exclude.read_text().splitlines() if exclude.exists() else []
+    changed = False
+    for entry in entries:
+        if entry not in lines:
+            lines.append(entry)
+            changed = True
+    if changed or not exclude.exists():
+        exclude.write_text("\n".join(line for line in lines if line).rstrip() + "\n")
+
+
+for repo in repo_roots:
+    ensure_exclude(repo, [".codex-autoresearch/"])
+ensure_exclude(primary_repo, ["results.tsv", "run.log"])
+
+results_path = primary_repo / "results.tsv"
+log_path = primary_repo / "run.log"
+if not results_path.exists():
+    results_path.write_text("experiment\tmetric\tstatus\tcommits\tdescription\n")
+
+metric_run = subprocess.run(
+    metric_command,
+    cwd=metric_repo,
+    shell=True,
+    text=True,
+    capture_output=True,
+    check=False,
+)
+log_text = "\n".join(part for part in [metric_run.stdout.strip(), metric_run.stderr.strip()] if part)
+log_path.write_text(log_text + ("\n" if log_text else ""))
+if metric_run.returncode != 0:
+    raise SystemExit(f"baseline metric command failed; inspect {log_path}")
+match = re.search(metric_regex, log_text, re.MULTILINE)
+if not match:
+    raise SystemExit(f"baseline metric could not be parsed from {log_path}")
+token = match.group(1) if match.groups() else match.group(0)
+baseline_value = float(token)
+
+repos_state = []
+best_commits = {}
+commit_labels = []
+for repo in repo_roots:
+    commit = git_run(repo, ["rev-parse", "HEAD"]).stdout.strip()
+    repo_state = {
+        "root": str(repo),
+        "name": repo.name,
+        "baseline_commit": commit,
+        "last_evaluated_commit": commit,
+        "in_scope": in_scope_map[str(repo)],
+        "out_of_scope": out_scope_map[str(repo)],
+    }
+    repos_state.append(repo_state)
+    best_commits[str(repo)] = commit
+    commit_labels.append(f"{repo.name}={commit}")
+
+with results_path.open("a", encoding="utf-8") as handle:
+    handle.write(f'0\t{baseline_value}\tbaseline\t{",".join(commit_labels)}\tunmodified code\n')
+
+state_dir = primary_repo / ".codex-autoresearch"
+state_dir.mkdir(parents=True, exist_ok=True)
+state_path = state_dir / "state.json"
+pointer_payload = {
+    "state_path": str(state_path),
+    "primary_repo": str(primary_repo),
+}
+for repo in repo_roots:
+    repo_state_dir = repo / ".codex-autoresearch"
+    repo_state_dir.mkdir(parents=True, exist_ok=True)
+    (repo_state_dir / "session.json").write_text(json.dumps(pointer_payload, indent=2) + "\n")
 
 state = {
-    "version": 2,
+    "version": 4,
     "active": True,
+    "execution_mode": "native",
+    "manual_reason": None,
     "last_transition": "baseline",
     "goal": goal,
     "metric_command": metric_command,
     "metric_regex": metric_regex,
     "direction": direction,
     "branch": branch,
+    "primary_repo": str(primary_repo),
+    "metric_repo": str(metric_repo),
     "baseline_value": baseline_value,
-    "baseline_commit": baseline_commit,
     "best_value": baseline_value,
-    "best_commit": baseline_commit,
     "best_description": "unmodified code",
+    "best_commits": best_commits,
     "last_metric": baseline_value,
     "last_status": "baseline",
-    "last_evaluated_commit": baseline_commit,
     "experiments_run": 0,
     "next_experiment": 1,
     "max_experiments": None if max_experiments_raw == "unlimited" else int(max_experiments_raw),
     "done_marker": "AUTORESEARCH_DONE",
-    "in_scope": in_scope,
-    "out_of_scope": out_of_scope,
     "constraints": constraints,
     "simplicity_policy": simplicity_policy,
-    "repo_root": str(root),
-    "results_path": results_path,
-    "log_path": log_path,
+    "repos": repos_state,
+    "results_path": str(results_path),
+    "log_path": str(log_path),
     "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     "stopped_at": None,
 }
-print(json.dumps(state))
+state_path.write_text(json.dumps(state, indent=2) + "\n")
+print(json.dumps(state, indent=2))
 PY
-)
+}
 
-  mkdir -p "$(state_dir)"
-  touch "$(state_dir)/run.log"
-  write_state "$(state_file)" "$state" >/dev/null
-  load_state
+status_loop() {
+  cat "$(resolve_state_path)"
 }
 
 toggle_active() {
   local value="$1"
-  python3 - "$(state_file)" "$value" <<'PY'
+  python3 - "$(resolve_state_path)" "$value" <<'PY'
 import datetime as dt
 import json
 import pathlib
@@ -283,8 +356,76 @@ print(json.dumps(state, indent=2))
 PY
 }
 
+set_execution_mode() {
+  local mode="$1"
+  local reason="${2:-}"
+  python3 - "$(resolve_state_path)" "$mode" "$reason" <<'PY'
+import datetime as dt
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+reason = sys.argv[3] or None
+state = json.loads(path.read_text())
+state["execution_mode"] = mode
+state["manual_reason"] = reason if mode == "manual" else None
+state["last_transition"] = "manual-fallback" if mode == "manual" else "resume-native"
+state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+path.write_text(json.dumps(state, indent=2) + "\n")
+print(json.dumps(state, indent=2))
+PY
+}
+
+manual_fallback_loop() {
+  local reason=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --reason)
+        reason="$2"
+        shift 2
+        ;;
+      *)
+        echo "unknown manual-fallback flag: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
+  if [[ -z "$reason" ]]; then
+    echo "manual-fallback requires --reason" >&2
+    exit 1
+  fi
+  ensure_hooks
+  set_execution_mode manual "$reason"
+}
+
+resume_native_loop() {
+  ensure_hooks
+  set_execution_mode native ""
+}
+
 reset_loop() {
-  rm -rf "$(state_dir)"
+  python3 - "$(resolve_state_path)" <<'PY'
+import json
+import pathlib
+import shutil
+import sys
+
+state_path = pathlib.Path(sys.argv[1])
+state = json.loads(state_path.read_text())
+for repo in state["repos"]:
+    session_dir = pathlib.Path(repo["root"]) / ".codex-autoresearch"
+    session_file = session_dir / "session.json"
+    if session_file.exists():
+        session_file.unlink()
+    if pathlib.Path(repo["root"]) != pathlib.Path(state["primary_repo"]):
+        try:
+            session_dir.rmdir()
+        except OSError:
+            pass
+shutil.rmtree(state_path.parent, ignore_errors=True)
+PY
 }
 
 case "$command_name" in
@@ -292,7 +433,7 @@ case "$command_name" in
     setup_loop "$@"
     ;;
   status)
-    load_state
+    status_loop
     ;;
   stop)
     toggle_active false
@@ -301,6 +442,12 @@ case "$command_name" in
   resume)
     ensure_hooks
     toggle_active true
+    ;;
+  resume-native)
+    resume_native_loop
+    ;;
+  manual-fallback)
+    manual_fallback_loop "$@"
     ;;
   reset)
     reset_loop

@@ -9,6 +9,8 @@ Use `$auto-research-codex` for metric-driven autonomous experimentation, not for
 
 This skill is based on the public `awesome-copilot/autoresearch` workflow, but uses Codex native hooks to keep the loop alive between turns.
 
+Default mode is one repo. Multi-repo tracking is optional and only turns on when you explicitly pass extra `--repo` flags.
+
 ## Phase 1: Setup
 
 Before the loop starts, collect and confirm every item below. Do not skip any.
@@ -56,6 +58,29 @@ What setup does:
 - adds `results.tsv`, `run.log`, and `.codex-autoresearch/` to `.git/info/exclude`
 - runs the baseline measurement and records experiment `0`
 
+Optional multi-repo extension:
+
+```bash
+bash scripts/autoresearch_loop.sh setup \
+  --repo /path/to/primary-repo \
+  --repo /path/to/second-repo \
+  --metric-repo /path/to/primary-repo \
+  --goal "<goal>" \
+  --metric-command "<command>" \
+  --metric-regex "<regex>" \
+  --direction higher|lower \
+  --in-scope primary-repo::src \
+  --in-scope second-repo::Sources \
+  --out-of-scope second-repo::Examples
+```
+
+Rules for multi-repo mode:
+
+- If you omit `--repo`, it stays single-repo.
+- Unqualified scope paths apply to the primary repo.
+- Qualified scope paths use `repo-name::relative/path`.
+- The Stop hook evaluates one experiment across all tracked repos atomically.
+
 ## Phase 3: Experiment loop
 
 Once active, keep iterating without asking whether to continue.
@@ -75,12 +100,13 @@ For each experiment:
 The hook enforces the autoresearch protocol:
 
 - baseline is preserved
-- every experiment must be committed before evaluation
+- every touched tracked repo must be committed before evaluation
 - out-of-scope changes are rejected
 - crashes and parse failures are logged and reverted
-- same-or-worse results are discarded with `git reset --hard HEAD~1`
+- same-or-worse results are discarded by resetting every changed tracked repo to the previous kept commit
 - improvements are kept and become the new best result
 - every evaluated experiment is appended to `results.tsv`
+- if the work expands beyond what one repo-local native loop can safely track, switch to manual fallback instead of letting the loop mis-track state
 
 ## Phase 4: End the loop
 
@@ -90,6 +116,29 @@ End cleanly by either:
 - or emitting a line that is exactly `AUTORESEARCH_DONE` only after the result is actually verified
 
 Both paths remove this skill's hook entries automatically.
+
+## Manual fallback
+
+If the work expands beyond one repo-local native loop, do not keep pretending the native keep/discard logic is still authoritative.
+
+If even tracked multi-repo mode is not enough, switch to manual fallback:
+
+```bash
+bash scripts/autoresearch_loop.sh manual-fallback --reason "<why native tracking is no longer safe>"
+```
+
+What manual fallback does:
+
+- keeps the hook and state alive
+- stops native keep/discard automation
+- continues injecting the autoresearch protocol on every turn
+- prevents the loop from silently collapsing just because the topology changed
+
+Return to native mode only when the work is back inside one safely tracked repo:
+
+```bash
+bash scripts/autoresearch_loop.sh resume-native
+```
 
 ## Outputs
 
