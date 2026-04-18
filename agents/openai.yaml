@@ -1,0 +1,4 @@
+interface:
+  display_name: "Auto Research Codex"
+  short_description: "Native-hook experiment loop for Codex"
+  default_prompt: "Use $auto-research-codex to run a native-hook experiment loop in this repo."
