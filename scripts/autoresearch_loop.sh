@@ -18,6 +18,14 @@ remove_hooks() {
   /bin/bash "$SCRIPT_DIR/uninstall.sh" >/dev/null
 }
 
+register_root() {
+  python3 "$SCRIPT_DIR/registry.py" add "$1" >/dev/null
+}
+
+unregister_root() {
+  python3 "$SCRIPT_DIR/registry.py" remove "$1" >/dev/null
+}
+
 resolve_state_path() {
   python3 - "$PWD" <<'PY'
 import json
@@ -127,8 +135,9 @@ setup_loop() {
     repos+=("$PWD")
   fi
 
+  local setup_json primary_root
   ensure_hooks
-  python3 - "$PWD" "$goal" "$metric_command" "$metric_regex" "$direction" "$max_experiments" "$simplicity_policy" "$metric_repo" "${repos[@]}" -- "${in_scope[@]}" -- "${out_of_scope[@]-}" -- "${constraints[@]-}" <<'PY'
+  setup_json=$(python3 - "$PWD" "$goal" "$metric_command" "$metric_regex" "$direction" "$max_experiments" "$simplicity_policy" "$metric_repo" "${repos[@]}" -- "${in_scope[@]}" -- "${out_of_scope[@]-}" -- "${constraints[@]-}" <<'PY'
 import datetime as dt
 import json
 import pathlib
@@ -343,6 +352,15 @@ state = {
 state_path.write_text(json.dumps(state, indent=2) + "\n")
 print(json.dumps(state, indent=2))
 PY
+)
+  primary_root=$(python3 - <<'PY' "$setup_json"
+import json
+import sys
+print(json.loads(sys.argv[1])["primary_repo"])
+PY
+)
+  register_root "$primary_root"
+  printf '%s\n' "$setup_json"
 }
 
 status_loop() {
@@ -351,7 +369,8 @@ status_loop() {
 
 toggle_active() {
   local value="$1"
-  python3 - "$(resolve_state_path)" "$value" <<'PY'
+  local state_json primary_root
+  state_json=$(python3 - "$(resolve_state_path)" "$value" <<'PY'
 import datetime as dt
 import json
 import pathlib
@@ -367,12 +386,26 @@ state["stopped_at"] = None if value else state["updated_at"]
 path.write_text(json.dumps(state, indent=2) + "\n")
 print(json.dumps(state, indent=2))
 PY
+)
+  primary_root=$(python3 - <<'PY' "$state_json"
+import json
+import sys
+print(json.loads(sys.argv[1])["primary_repo"])
+PY
+)
+  if [[ "$value" == "true" ]]; then
+    register_root "$primary_root"
+  else
+    unregister_root "$primary_root"
+  fi
+  printf '%s\n' "$state_json"
 }
 
 set_execution_mode() {
   local mode="$1"
   local reason="${2:-}"
-  python3 - "$(resolve_state_path)" "$mode" "$reason" <<'PY'
+  local state_json primary_root
+  state_json=$(python3 - "$(resolve_state_path)" "$mode" "$reason" <<'PY'
 import datetime as dt
 import json
 import pathlib
@@ -389,6 +422,15 @@ state["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
 path.write_text(json.dumps(state, indent=2) + "\n")
 print(json.dumps(state, indent=2))
 PY
+)
+  primary_root=$(python3 - <<'PY' "$state_json"
+import json
+import sys
+print(json.loads(sys.argv[1])["primary_repo"])
+PY
+)
+  register_root "$primary_root"
+  printf '%s\n' "$state_json"
 }
 
 manual_fallback_loop() {
@@ -419,7 +461,16 @@ resume_native_loop() {
 }
 
 reset_loop() {
-  python3 - "$(resolve_state_path)" <<'PY'
+  local state_path primary_root
+  state_path=$(resolve_state_path)
+  primary_root=$(python3 - <<'PY' "$state_path"
+import json
+import pathlib
+import sys
+print(json.loads(pathlib.Path(sys.argv[1]).read_text())["primary_repo"])
+PY
+)
+  python3 - "$state_path" <<'PY'
 import json
 import pathlib
 import shutil
@@ -439,6 +490,7 @@ for repo in state["repos"]:
             pass
 shutil.rmtree(state_path.parent, ignore_errors=True)
 PY
+  unregister_root "$primary_root"
 }
 
 case "$command_name" in

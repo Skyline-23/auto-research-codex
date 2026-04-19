@@ -69,7 +69,12 @@ def ensure_feature_flag(path: pathlib.Path) -> None:
 def load_hooks(path: pathlib.Path) -> dict:
     if not path.exists():
         return {"hooks": {}}
-    data = json.loads(path.read_text())
+    text = path.read_text()
+    decoder = json.JSONDecoder()
+    try:
+        data, _ = decoder.raw_decode(text.lstrip())
+    except json.JSONDecodeError:
+        data = {"hooks": {}}
     if not isinstance(data, dict):
         raise SystemExit("hooks.json must contain an object")
     hooks = data.setdefault("hooks", {})
@@ -78,12 +83,11 @@ def load_hooks(path: pathlib.Path) -> dict:
     return data
 
 
-def ensure_group(event_groups, command, status_message, matcher=None, timeout=None):
+def ensure_group(event_groups, command, matcher=None, timeout=None):
     for group in event_groups:
         for hook in group.get("hooks", []):
             if hook.get("command") == command:
-                if status_message:
-                    hook["statusMessage"] = status_message
+                hook.pop("statusMessage", None)
                 if timeout is not None:
                     hook["timeout"] = timeout
                 if matcher is not None:
@@ -93,8 +97,6 @@ def ensure_group(event_groups, command, status_message, matcher=None, timeout=No
                 return
 
     hook = {"type": "command", "command": command}
-    if status_message:
-        hook["statusMessage"] = status_message
     if timeout is not None:
         hook["timeout"] = timeout
     group = {"hooks": [hook]}
@@ -114,20 +116,17 @@ stop_groups = hooks.setdefault("Stop", [])
 ensure_group(
     session_groups,
     session_command,
-    "Autoresearch: loading experiment state",
     matcher="startup|resume",
     timeout=5,
 )
 ensure_group(
     prompt_groups,
     prompt_command,
-    "Autoresearch: refreshing experiment state",
     timeout=5,
 )
 ensure_group(
     stop_groups,
     stop_command,
-    "Autoresearch: evaluating experiment loop",
     timeout=30,
 )
 

@@ -8,6 +8,17 @@ HOOKS_PATH="$CODEX_HOME/hooks.json"
 
 mkdir -p "$CODEX_HOME"
 
+ACTIVE_JSON=$(python3 "$SCRIPT_DIR/registry.py" has-active)
+if [[ "$(python3 - <<'PY' "$ACTIVE_JSON"
+import json
+import sys
+print("true" if json.loads(sys.argv[1]).get("active") else "false")
+PY
+)" == "true" ]]; then
+  printf '%s\n' "$ACTIVE_JSON"
+  exit 0
+fi
+
 python3 - "$HOOKS_PATH" "$SKILL_ROOT" <<'PY'
 import json
 import pathlib
@@ -26,7 +37,12 @@ if not hooks_path.exists():
     print(json.dumps({"hooks_path": str(hooks_path), "removed": 0, "ok": True}, indent=2))
     raise SystemExit(0)
 
-data = json.loads(hooks_path.read_text())
+text = hooks_path.read_text()
+decoder = json.JSONDecoder()
+try:
+    data, _ = decoder.raw_decode(text.lstrip())
+except json.JSONDecodeError:
+    data = {"hooks": {}}
 if not isinstance(data, dict):
     raise SystemExit("hooks.json must contain an object")
 
