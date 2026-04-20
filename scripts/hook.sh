@@ -70,20 +70,20 @@ def write_state(path, state):
     path.write_text(json.dumps(state, indent=2) + "\n")
 
 
-def registry_update(command, primary_repo):
-    script = pathlib.Path(os.environ["HOOK_SCRIPT_DIR"]) / "registry.py"
-    subprocess.run(
-        ["python3", str(script), command, primary_repo],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-
-def cleanup_hooks():
+def cleanup_hooks(state=None, current_root=None):
+    repo_roots = []
+    if isinstance(state, dict):
+        for repo in state.get("repos", []):
+            root = repo.get("root")
+            if isinstance(root, str) and root:
+                repo_roots.append(str(pathlib.Path(root).resolve()))
+    if not repo_roots and current_root is not None:
+        repo_roots.append(str(pathlib.Path(current_root).resolve()))
+    if not repo_roots:
+        return
     script = pathlib.Path(os.environ["HOOK_SCRIPT_DIR"]) / "uninstall.sh"
     subprocess.run(
-        ["/bin/bash", str(script)],
+        ["/bin/bash", str(script), *repo_roots],
         text=True,
         capture_output=True,
         check=False,
@@ -194,8 +194,7 @@ def maybe_finish(state, state_path):
         state["stopped_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         state["updated_at"] = state["stopped_at"]
         write_state(state_path, state)
-        registry_update("remove", state["primary_repo"])
-        cleanup_hooks()
+        cleanup_hooks(state)
         return True
     return False
 
@@ -221,9 +220,7 @@ if root is None:
 
 state, state_path = load_state(root)
 if not state or not state.get("active"):
-    if state and isinstance(state, dict) and state.get("primary_repo"):
-        registry_update("remove", state["primary_repo"])
-    cleanup_hooks()
+    cleanup_hooks(state, root)
     raise SystemExit(0)
 
 if event in {"session-start", "user-prompt"}:
@@ -249,8 +246,7 @@ if has_done_marker(last_message, state["done_marker"]):
     state["stopped_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
     state["updated_at"] = state["stopped_at"]
     write_state(state_path, state)
-    registry_update("remove", state["primary_repo"])
-    cleanup_hooks()
+    cleanup_hooks(state)
     raise SystemExit(0)
 
 if state.get("execution_mode") == "manual":

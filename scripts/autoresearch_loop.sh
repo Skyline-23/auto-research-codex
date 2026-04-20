@@ -11,19 +11,11 @@ fi
 shift
 
 ensure_hooks() {
-  /bin/bash "$SCRIPT_DIR/install.sh" >/dev/null
+  /bin/bash "$SCRIPT_DIR/install.sh" "$@" >/dev/null
 }
 
 remove_hooks() {
-  /bin/bash "$SCRIPT_DIR/uninstall.sh" >/dev/null
-}
-
-register_root() {
-  python3 "$SCRIPT_DIR/registry.py" add "$1" >/dev/null
-}
-
-unregister_root() {
-  python3 "$SCRIPT_DIR/registry.py" remove "$1" >/dev/null
+  /bin/bash "$SCRIPT_DIR/uninstall.sh" "$@" >/dev/null
 }
 
 resolve_state_path() {
@@ -53,6 +45,20 @@ if pointer_path.exists():
     print(json.loads(pointer_path.read_text())["state_path"])
     raise SystemExit(0)
 raise SystemExit(f"no autoresearch state for {root}")
+PY
+}
+
+tracked_repo_roots() {
+  python3 - "$(resolve_state_path)" <<'PY'
+import json
+import pathlib
+import sys
+
+state = json.loads(pathlib.Path(sys.argv[1]).read_text())
+for repo in state.get("repos", []):
+    root = repo.get("root")
+    if isinstance(root, str) and root:
+        print(root)
 PY
 }
 
@@ -135,8 +141,7 @@ setup_loop() {
     repos+=("$PWD")
   fi
 
-  local setup_json primary_root
-  ensure_hooks
+  local setup_json
   setup_json=$(python3 - "$PWD" "$goal" "$metric_command" "$metric_regex" "$direction" "$max_experiments" "$simplicity_policy" "$metric_repo" "${repos[@]}" -- "${in_scope[@]}" -- "${out_of_scope[@]-}" -- "${constraints[@]-}" <<'PY'
 import datetime as dt
 import json
@@ -353,13 +358,19 @@ state_path.write_text(json.dumps(state, indent=2) + "\n")
 print(json.dumps(state, indent=2))
 PY
 )
-  primary_root=$(python3 - <<'PY' "$setup_json"
+  repos=()
+  while IFS= read -r repo_root; do
+    if [[ -n "$repo_root" ]]; then
+      repos+=("$repo_root")
+    fi
+  done < <(python3 - <<'PY' "$setup_json"
 import json
 import sys
-print(json.loads(sys.argv[1])["primary_repo"])
+for repo in json.loads(sys.argv[1])["repos"]:
+    print(repo["root"])
 PY
 )
-  register_root "$primary_root"
+  ensure_hooks "${repos[@]}"
   printf '%s\n' "$setup_json"
 }
 
@@ -369,7 +380,7 @@ status_loop() {
 
 toggle_active() {
   local value="$1"
-  local state_json primary_root
+  local state_json
   state_json=$(python3 - "$(resolve_state_path)" "$value" <<'PY'
 import datetime as dt
 import json
@@ -387,24 +398,13 @@ path.write_text(json.dumps(state, indent=2) + "\n")
 print(json.dumps(state, indent=2))
 PY
 )
-  primary_root=$(python3 - <<'PY' "$state_json"
-import json
-import sys
-print(json.loads(sys.argv[1])["primary_repo"])
-PY
-)
-  if [[ "$value" == "true" ]]; then
-    register_root "$primary_root"
-  else
-    unregister_root "$primary_root"
-  fi
   printf '%s\n' "$state_json"
 }
 
 set_execution_mode() {
   local mode="$1"
   local reason="${2:-}"
-  local state_json primary_root
+  local state_json
   state_json=$(python3 - "$(resolve_state_path)" "$mode" "$reason" <<'PY'
 import datetime as dt
 import json
@@ -423,13 +423,6 @@ path.write_text(json.dumps(state, indent=2) + "\n")
 print(json.dumps(state, indent=2))
 PY
 )
-  primary_root=$(python3 - <<'PY' "$state_json"
-import json
-import sys
-print(json.loads(sys.argv[1])["primary_repo"])
-PY
-)
-  register_root "$primary_root"
   printf '%s\n' "$state_json"
 }
 
@@ -451,25 +444,30 @@ manual_fallback_loop() {
     echo "manual-fallback requires --reason" >&2
     exit 1
   fi
-  ensure_hooks
+  local repo_roots=()
+  while IFS= read -r repo_root; do
+    if [[ -n "$repo_root" ]]; then
+      repo_roots+=("$repo_root")
+    fi
+  done < <(tracked_repo_roots)
+  ensure_hooks "${repo_roots[@]}"
   set_execution_mode manual "$reason"
 }
 
 resume_native_loop() {
-  ensure_hooks
+  local repo_roots=()
+  while IFS= read -r repo_root; do
+    if [[ -n "$repo_root" ]]; then
+      repo_roots+=("$repo_root")
+    fi
+  done < <(tracked_repo_roots)
+  ensure_hooks "${repo_roots[@]}"
   set_execution_mode native ""
 }
 
 reset_loop() {
-  local state_path primary_root
+  local state_path
   state_path=$(resolve_state_path)
-  primary_root=$(python3 - <<'PY' "$state_path"
-import json
-import pathlib
-import sys
-print(json.loads(pathlib.Path(sys.argv[1]).read_text())["primary_repo"])
-PY
-)
   python3 - "$state_path" <<'PY'
 import json
 import pathlib
@@ -490,7 +488,6 @@ for repo in state["repos"]:
             pass
 shutil.rmtree(state_path.parent, ignore_errors=True)
 PY
-  unregister_root "$primary_root"
 }
 
 case "$command_name" in
@@ -501,11 +498,23 @@ case "$command_name" in
     status_loop
     ;;
   stop)
+    repo_roots=()
+    while IFS= read -r repo_root; do
+      if [[ -n "$repo_root" ]]; then
+        repo_roots+=("$repo_root")
+      fi
+    done < <(tracked_repo_roots)
     toggle_active false
-    remove_hooks
+    remove_hooks "${repo_roots[@]}"
     ;;
   resume)
-    ensure_hooks
+    repo_roots=()
+    while IFS= read -r repo_root; do
+      if [[ -n "$repo_root" ]]; then
+        repo_roots+=("$repo_root")
+      fi
+    done < <(tracked_repo_roots)
+    ensure_hooks "${repo_roots[@]}"
     toggle_active true
     ;;
   resume-native)
@@ -515,8 +524,14 @@ case "$command_name" in
     manual_fallback_loop "$@"
     ;;
   reset)
+    repo_roots=()
+    while IFS= read -r repo_root; do
+      if [[ -n "$repo_root" ]]; then
+        repo_roots+=("$repo_root")
+      fi
+    done < <(tracked_repo_roots)
     reset_loop
-    remove_hooks
+    remove_hooks "${repo_roots[@]}"
     ;;
   *)
     echo "unknown command: $command_name" >&2
